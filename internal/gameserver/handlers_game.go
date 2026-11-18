@@ -1313,7 +1313,8 @@ func hFishingPull(ctx *Ctx) ([]byte, bool) {
 	st.mu.Unlock()
 	if needsConfirmation && nibble {
 		finishNibbleHook(ctx, st, pending, gear, castActive, resolved)
-		ctx.Log.Info("14/9 海钓嘬饵未中钩，重新排鱼", "rod", shortGUID(gear),
+		// 同 14/11：重排成败由 finishNibbleHook 内部 warn，这里不声称成功。
+		ctx.Log.Info("14/9 海钓嘬饵未中钩，已否决收尾", "rod", shortGUID(gear),
 			"fish", shortGUID(pending.FishGUID), "species", pending.Species)
 		return nil, true
 	}
@@ -1412,7 +1413,9 @@ func hFishingHooked(ctx *Ctx) ([]byte, bool) {
 	ctx.Log.Info("14/11 中鱼", "rod", shortGUID(gear), "fish", shortGUID(fishGUID), "species", species, "was_hooked", wasHooked)
 	if nibble {
 		finishNibbleHook(ctx, st, pending, gear, castActive, resolved)
-		ctx.Log.Info("14/11 嘬饵未中钩，重新排鱼", "fish", shortGUID(fishGUID), "species", species)
+		// 重排是否成功由 finishNibbleHook 内部判定并 warn，这里只记否决收尾，
+		// 不再无条件声称"重新排鱼"——守卫拒绝时那行日志会把哑火掩盖掉。
+		ctx.Log.Info("14/11 嘬饵未中钩，已否决收尾", "fish", shortGUID(fishGUID), "species", species)
 		return nil, true
 	}
 	// 扣饵不在中鱼确认瞬间执行：此时客户端搏鱼 ctor 正在读取挂载态，扣饵
@@ -1484,14 +1487,25 @@ func finishNibbleHook(ctx *Ctx, st *FishState, pending *RolledFish, gear string,
 	st.mu.Lock()
 	if st.Pending == pending {
 		st.Pending = nil
-		st.PushSent = false
-		st.Hooked = false
-		st.Resolved = false
-		st.PendingRepush = 0
 	}
+	// 下面几个守卫必须无条件清。14/11 解锁后到这里之间夹着扣饵 DB 写与
+	// 14/15 网络推送，并发的 14/12 可能已经改过 st.Pending；若把清状态绑在
+	// st.Pending == pending 上，PushSent 会残留 true，scheduleBiteState 的
+	// !resetCast 守卫直接 return false —— 日志却照打"重新排鱼"，整竿哑火。
+	st.PushSent = false
+	st.Hooked = false
+	st.Resolved = false
+	st.PendingRepush = 0
+	st.pushing = nil
 	st.mu.Unlock()
 	if castActive && !resolved {
-		srv.scheduleBiteState(ctx.Sess, st, false, false)
+		if !srv.scheduleBiteState(ctx.Sess, st, false, false) {
+			fish := ""
+			if pending != nil {
+				fish = shortGUID(pending.FishGUID)
+			}
+			ctx.Log.Warn("嘬饵否决后重排咬钩失败", "rod", shortGUID(gear), "fish", fish)
+		}
 	}
 }
 
@@ -1556,6 +1570,15 @@ func hFishingLeft(ctx *Ctx) ([]byte, bool) {
 				hooked := extra.HookConfirmed
 				removeExtraAt(st, i)
 				rodGUID := st.GearGuid
+				// 这是最后一尾、主鱼也不在时必须重排：旧实现无条件 return，
+				// 多钩底钓最后一尾咬饵未咬钩离场后整竿再也不会派鱼。
+				reschedule := st.CastActive && st.Pending == nil && len(st.Extra) == 0
+				if reschedule {
+					st.PushSent = false
+					st.Hooked = false
+					st.Resolved = false
+					st.pushing = nil
+				}
 				st.mu.Unlock()
 				if hooked {
 					if err := srv.consumeHookedBait(ctx.Sess, extra, rodGUID); err != nil {
@@ -1564,6 +1587,9 @@ func hFishingLeft(ctx *Ctx) ([]byte, bool) {
 				}
 				ctx.Log.Info("14/12 额外鱼离场", "fish", shortGUID(extra.FishGUID),
 					"hooked", hooked)
+				if reschedule && !srv.scheduleBiteState(ctx.Sess, st, false, false) {
+					ctx.Log.Warn("14/12 额外鱼离场后重排咬钩失败", "rod", shortGUID(rodGUID))
+				}
 				return nil, true
 			}
 		}
@@ -1639,6 +1665,10 @@ func hFishingLeft(ctx *Ctx) ([]byte, bool) {
 		st.PushSent = false
 		st.Hooked = false
 		st.Resolved = false
+		// 与 finishNibbleHook 同款守卫：pushPendingBite 在 generation 变化时
+		// 会早于 st.pushing=nil 返回，残留的非 nil 会让下面的 scheduleBiteState
+		// (!resetCast) 直接拒绝重排，且旧代码丢弃返回值——日志什么都不打。
+		st.pushing = nil
 		castActive := st.CastActive
 		inWater := st.InWater
 		loc, spot := st.Loc, st.Spot
@@ -1681,7 +1711,10 @@ func hFishingLeft(ctx *Ctx) ([]byte, bool) {
 			return nil, true
 		}
 		if castActive && inWater {
-			srv.scheduleBiteState(ctx.Sess, st, false, false)
+			// 钓组在水中才排下一次咬钩。
+			if !srv.scheduleBiteState(ctx.Sess, st, false, false) {
+				ctx.Log.Warn("14/12 离场后重排咬钩失败", "rod", shortGUID(rodGUID), "f0", f0)
+			}
 		}
 		return nil, true
 	}

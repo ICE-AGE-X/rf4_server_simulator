@@ -560,7 +560,9 @@ func (s *Server) biteBaitSnapshot(ctx context.Context, rod string) (string, bool
 }
 
 // consumeBaitEvent 与库存更新共用一个事务，重复咬口、重推及重启不会再扣。
-func (s *Server) consumeBaitEvent(ctx context.Context, uid int64, rod, event string, ids []string, cast bool) (baitChange, error) {
+// wearOnly 由嘬饵路径传入：未挂牢的鱼只按拟饵磨损扣耐久，不扣天然饵份数，
+// 与 specs/capabilities/bite-bait-and-spawn.md §1 对齐。其余调用保持原语义。
+func (s *Server) consumeBaitEvent(ctx context.Context, uid int64, rod, event string, ids []string, cast bool, wearOnly ...bool) (baitChange, error) {
 	var out baitChange
 	if s.DB == nil || rod == "" || event == "" {
 		return out, nil
@@ -632,6 +634,9 @@ func (s *Server) consumeBaitEvent(ctx context.Context, uid int64, rod, event str
 			return out, err
 		}
 		consumed, wear := baitUseRule(def, cast)
+		if len(wearOnly) > 0 && wearOnly[0] {
+			consumed = false
+		}
 		if consumed && baitQuantity(row) <= 0 {
 			return out, fmt.Errorf("挂载饵料已用尽")
 		}
@@ -784,12 +789,14 @@ func (s *Server) consumeHookedBait(sess *Session, f *RolledFish, rod string) err
 
 // consumeNibbleBait 处理“鱼碰到/嘬到饵但没中钩”的轻量消耗。
 // 事件键加 :nibble，与同一条鱼的中钩扣饵分开，避免重放重复扣。
+// 未挂牢不扣天然饵份数：否则底钓最后一份饵被嘬光后，重排的咬钩到点会被
+// canFishWithBait 判空竿并置 Resolved，整竿不再派鱼。拟饵仍按原规则磨损。
 func (s *Server) consumeNibbleBait(sess *Session, f *RolledFish, rod string) error {
 	if sess == nil || f == nil || !f.BaitsKnown {
 		return nil
 	}
 	change, err := s.consumeBaitEvent(sess.pushCtx(), sess.Userid, rod,
-		f.FishGUID+":nibble", strings.Fields(f.BaitGUIDs), false)
+		f.FishGUID+":nibble", strings.Fields(f.BaitGUIDs), false, true)
 	if err != nil {
 		return err
 	}
